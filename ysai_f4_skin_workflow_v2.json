@@ -1,0 +1,271 @@
+{
+  "name": "YSAI F4 - 시계열 피부 솔루션 (v2)",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "시계열 데이터 기반 초개인화 피부 솔루션",
+        "formDescription": "오늘의 피부 사진과 (선택) 처방전/소견서 PDF를 업로드하면 AI가 7일 변화 추이를 분석하고 신뢰도 필터를 거친 실제 후기 기반 맞춤 솔루션을 이메일로 보내드립니다.",
+        "formFields": {
+          "values": [
+            { "fieldLabel": "이름", "fieldType": "text", "requiredField": true },
+            { "fieldLabel": "이메일", "fieldType": "email", "requiredField": true },
+            { "fieldLabel": "user_id", "fieldType": "text", "requiredField": true },
+            { "fieldLabel": "skin_photo", "fieldType": "file", "requiredField": true, "acceptFileTypes": ".jpg,.jpeg,.png" },
+            { "fieldLabel": "prescription_pdf", "fieldType": "file", "requiredField": false, "acceptFileTypes": ".pdf,.png,.jpg,.jpeg" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-form",
+      "name": "피부 일기 폼",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [240, 400],
+      "webhookId": "skin-care-form"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SKIN_ANALYZER_URL }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            { "parameterType": "formBinaryData", "name": "image", "inputDataFieldName": "skin_photo" },
+            { "name": "metrics", "value": "redness,acne_count,texture,hydration,pigmentation,pore" },
+            { "name": "normalize", "value": "face_align,white_balance" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-skin-analyze",
+      "name": "피부 사진 분석 API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 400],
+      "credentials": { "httpHeaderAuth": { "id": "skin-analyzer-key", "name": "Skin Analyzer API Key" } },
+      "notes": "외부 CV 모델 호출. 반환 예: {redness, acne_count, texture, hydration, pigmentation, pore}.\nMVP: 사내 FastAPI / Replicate / HF Endpoint."
+    },
+    {
+      "parameters": {
+        "jsCode": "// 시계열 누적 + 베이스라인 대비 상대 변화율 (실서비스는 DB 조회 노드로 교체)\nconst userId = $('피부 일기 폼').item.json['user_id'];\nconst today = new Date().toISOString();\nconst current = $json;\n\n// 데모용 정적 history\nconst history = [\n  { date: '2026-05-08', redness: 55, acne_count: 12, texture: 60, hydration: 45, pigmentation: 35, pore: 50 },\n  { date: '2026-05-09', redness: 52, acne_count: 11, texture: 62, hydration: 47, pigmentation: 34, pore: 50 },\n  { date: '2026-05-10', redness: 50, acne_count: 10, texture: 63, hydration: 48, pigmentation: 34, pore: 49 }\n];\nconst series = [...history, { date: today, ...current }];\nconst metrics = ['redness','acne_count','texture','hydration','pigmentation','pore'];\n\nconst baseline = {};\nmetrics.forEach(m => {\n  const head = series.slice(0,3).map(x => x[m]).filter(v => typeof v === 'number');\n  baseline[m] = head.reduce((a,b)=>a+b,0) / Math.max(head.length,1);\n});\n\nconst latest = series[series.length-1];\nconst delta = {};\nmetrics.forEach(m => {\n  delta[m] = baseline[m] ? Math.round(((latest[m]-baseline[m])/baseline[m])*1000)/10 : 0;\n});\n\nconst ma7 = {};\nmetrics.forEach(m => {\n  const vals = series.slice(-7).map(x => x[m]).filter(v => typeof v === 'number');\n  ma7[m] = Math.round((vals.reduce((a,b)=>a+b,0) / Math.max(vals.length,1))*10)/10;\n});\n\nconst worse = metrics\n  .map(m => {\n    const lowerBetter = ['redness','acne_count','pigmentation','pore'].includes(m);\n    return { metric: m, badness: lowerBetter ? delta[m] : -delta[m] };\n  })\n  .sort((a,b) => b.badness - a.badness)\n  .slice(0,2)\n  .map(o => o.metric);\n\nreturn [{\n  json: {\n    user_id: userId,\n    name: $('피부 일기 폼').item.json['이름'],\n    email: $('피부 일기 폼').item.json['이메일'],\n    date: today,\n    latest, baseline, delta_pct: delta, ma7,\n    worse_metrics: worse,\n    series\n  }\n}];"
+      },
+      "id": "node-timeseries",
+      "name": "시계열 분석 (변화율)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $binary.prescription_pdf !== undefined }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-if-rx",
+      "name": "처방전 있나?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [900, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.upstage.ai/v1/document-ai/document-parse",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            { "parameterType": "formBinaryData", "name": "document", "inputDataFieldName": "prescription_pdf" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-docparse",
+      "name": "Upstage Document Parse",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 280],
+      "credentials": { "httpHeaderAuth": { "id": "upstage-api-key", "name": "Upstage API Key" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const result = $json;\nlet fullText = '';\nif (result.content && result.content.html) {\n  fullText = result.content.html.replace(/<[^>]*>/g, ' ').replace(/\\s+/g, ' ').trim();\n} else if (result.content && result.content.text) {\n  fullText = result.content.text;\n} else if (result.pages) {\n  fullText = result.pages.map(p => p.text || '').join('\\n');\n}\n\nconst drugs = [...new Set((fullText.match(/(이소트레티노인|독시사이클린|아젤라산|트레티노인|클린다마이신|아다팔렌|미노사이클린|로아큐탄)/g) || []))];\nconst diagnoses = [...new Set((fullText.match(/(여드름|주사|지루성 피부염|아토피|색소침착|기미|홍반)/g) || []))];\nconst procedures = [...new Set((fullText.match(/(레이저토닝|프락셀|울쎄라|보톡스|필링|MTS|IPL)/g) || []))];\n\nreturn [{ json: { raw_text: fullText.substring(0, 4000), drugs, diagnoses, procedures } }];"
+      },
+      "id": "node-med-struct",
+      "name": "의료 정보 구조화",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 280]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "e1", "name": "raw_text", "value": "", "type": "string" },
+            { "id": "e2", "name": "drugs", "value": "={{ [] }}", "type": "array" },
+            { "id": "e3", "name": "diagnoses", "value": "={{ [] }}", "type": "array" },
+            { "id": "e4", "name": "procedures", "value": "={{ [] }}", "type": "array" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-no-rx",
+      "name": "처방전 없음 → 빈값",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1120, 520]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "id": "node-merge",
+      "name": "시계열 + 의료 결합",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [1560, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 시계열 + 의료 데이터로 Google News RSS 검색 URL 빌드\nconst ts = $('시계열 분석 (변화율)').item.json;\nlet med = { drugs: [], diagnoses: [], procedures: [] };\ntry { med = $('의료 정보 구조화').item.json; } catch(e) {\n  try { med = $('처방전 없음 → 빈값').item.json; } catch(_) {}\n}\n\nconst metricToKo = {\n  redness: '얼굴 붉은기',\n  acne_count: '여드름 트러블',\n  texture: '피부결',\n  hydration: '피부 수분 부족',\n  pigmentation: '색소침착',\n  pore: '모공 확장'\n};\nconst worse = (ts.worse_metrics || []).map(m => metricToKo[m]).filter(Boolean);\nconst diags = med.diagnoses || [];\nconst drugs = med.drugs || [];\n\nconst feeds = [];\nworse.forEach(w => feeds.push({ type: '후기/내돈내산', q: `${w} 개선 후기 내돈내산` }));\nworse.forEach(w => feeds.push({ type: '홈케어/루틴', q: `${w} 홈케어 루틴 추천` }));\ndiags.forEach(d => feeds.push({ type: '진단별 케어', q: `${d} 케어 방법` }));\ndrugs.forEach(g => feeds.push({ type: '약품 병행 제품', q: `${g} 복용 중 사용 가능한 화장품` }));\nif (feeds.length === 0) feeds.push({ type: '일반 후기', q: '피부 트러블 개선 후기' });\nfeeds.push({ type: '업계 뉴스', q: '피부과 트렌드 케어 신제품' });\n\nconst urls = feeds.slice(0, 6).map(f => ({\n  type: f.type,\n  q: f.q,\n  url: `https://news.google.com/rss/search?q=${encodeURIComponent(f.q)}&hl=ko&gl=KR&ceid=KR:ko`,\n  ts, med\n}));\n\nreturn urls.map(u => ({ json: u }));"
+      },
+      "id": "node-build-feeds",
+      "name": "검색 쿼리 & RSS URL 빌드",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 400]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": { "response": { "response": { "responseFormat": "text" } } }
+      },
+      "id": "node-rss-fetch",
+      "name": "RSS 피드 호출",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2000, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// RSS XML 파싱 (정규식 기반, 신뢰도 1차 분류 동시 진행)\nconst xml = $json.data || '';\nconst type = $('검색 쿼리 & RSS URL 빌드').item.json.type;\nconst q = $('검색 쿼리 & RSS URL 빌드').item.json.q;\n\nfunction parseItems(xml, max) {\n  const items = [];\n  const matches = xml.matchAll(/<item>([\\s\\S]*?)<\\/item>/g);\n  for (const m of matches) {\n    const block = m[1];\n    const titleM = block.match(/<title>(?:<!\\[CDATA\\[)?(.*?)(?:\\]\\]>)?<\\/title>/);\n    const linkM = block.match(/<link>([^<]+)<\\/link>/) || block.match(/<guid[^>]*>([^<]+)<\\/guid>/);\n    const srcM = block.match(/<source[^>]*>(?:<!\\[CDATA\\[)?(.*?)(?:\\]\\]>)?<\\/source>/);\n    const descM = block.match(/<description>(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?<\\/description>/);\n    const title = titleM ? titleM[1].replace(/<[^>]*>/g,'').trim() : '';\n    const link = linkM ? linkM[1].trim() : '';\n    const source = srcM ? srcM[1].trim() : '';\n    const desc = descM ? descM[1].replace(/<[^>]*>/g,' ').replace(/\\s+/g,' ').trim().slice(0, 400) : '';\n    if (title && title.length > 5 && !title.includes('Google News')) {\n      items.push({ title, link, source, snippet: desc });\n    }\n    if (items.length >= max) break;\n  }\n  return items;\n}\n\n// Trust Filter 1차 (규칙 기반)\nconst sponsorKw = ['협찬','체험단','제공받','#광고','업체로부터','소정의 원고료','내돈내산은 아니','광고 포함'];\nconst adKw = ['이벤트','할인코드','쿠폰','지금 구매','즉시 할인','#PR'];\nconst medAdKw = ['상담문의','전화 예약','이벤트가','클리닉 추천'];\nconst trustedKw = ['내돈내산','내 돈 내산','직접 구매','솔직 후기','단점','별로','실패'];\n\nfunction trustOf(text) {\n  if (sponsorKw.some(k => text.includes(k))) return { label: 'sponsored', score: 0.4 };\n  if (medAdKw.some(k => text.includes(k))) return { label: 'medical_ad', score: 0.0 };\n  if (adKw.some(k => text.includes(k))) return { label: 'ad', score: 0.1 };\n  if (trustedKw.some(k => text.includes(k))) return { label: 'organic', score: 1.0 };\n  return { label: 'unknown', score: 0.6 };\n}\n\nconst raw = parseItems(xml, 8);\nconst filtered = raw\n  .map(it => {\n    const t = trustOf(`${it.title} ${it.snippet}`);\n    return { ...it, type, q, trust_label: t.label, trust_score: t.score };\n  })\n  .filter(it => it.trust_score >= 0.4);\n\nreturn filtered.map(x => ({ json: x }));"
+      },
+      "id": "node-rss-parse",
+      "name": "RSS 파싱 + Trust Filter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2220, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 모든 RSS 항목을 그룹핑 + Solar 입력 JSON 빌드\nconst all = $input.all().map(i => i.json);\nconst byType = {};\nfor (const r of all) {\n  if (!byType[r.type]) byType[r.type] = [];\n  byType[r.type].push(r);\n}\n// 타입별 상위 3개\nconst topRefs = [];\nfor (const t of Object.keys(byType)) {\n  byType[t].sort((a,b) => b.trust_score - a.trust_score);\n  topRefs.push(...byType[t].slice(0, 3).map(x => ({ type: t, title: x.title, link: x.link, source: x.source, snippet: x.snippet, trust_label: x.trust_label, trust_score: x.trust_score })));\n}\n\nconst ts = $('시계열 분석 (변화율)').item.json;\nlet med = { drugs: [], diagnoses: [], procedures: [] };\ntry { med = $('의료 정보 구조화').item.json; } catch(e) {\n  try { med = $('처방전 없음 → 빈값').item.json; } catch(_) {}\n}\n\nconst payload = {\n  user_id: ts.user_id,\n  name: ts.name,\n  email: ts.email,\n  date: ts.date,\n  skin: {\n    latest: ts.latest,\n    baseline: ts.baseline,\n    delta_pct: ts.delta_pct,\n    ma7: ts.ma7,\n    worse_metrics: ts.worse_metrics\n  },\n  medical: { drugs: med.drugs || [], diagnoses: med.diagnoses || [], procedures: med.procedures || [] },\n  references: topRefs\n};\n\nconst body = JSON.stringify({\n  model: 'solar-pro3',\n  messages: [\n    {\n      role: 'system',\n      content: '당신은 따뜻하고 명확한 한국어 피부 코치입니다. 의료 진단을 단정하지 않고 \"병원 상담을 고려해볼 수 있는 시그널\" 톤으로 안내하세요. 반드시 순수 JSON만 출력하세요(마크다운/코드블록/앞뒤 설명 금지). 키는 summary(2-3문장), trend(개선/악화/유지 한 단어), today_actions(문자열 배열 3개), recommended_ingredients(배열), avoid_ingredients(배열), case_matches(객체 배열: title, link, why_relevant), see_doctor_signal(boolean), disclaimer(고정 문구).'\n    },\n    {\n      role: 'user',\n      content: `다음은 한 사용자의 시계열 피부 데이터, 의료 정보, 신뢰도 필터를 통과한 후기 레퍼런스입니다. 사용자 맞춤 솔루션을 JSON으로 반환하세요.\\n\\n=== 데이터 ===\\n${JSON.stringify(payload)}`\n    }\n  ],\n  response_format: { type: 'json_object' },\n  temperature: 0.3,\n  max_tokens: 1500\n});\n\nreturn [{ json: { body, payload } }];"
+      },
+      "id": "node-solar-prep",
+      "name": "Solar 입력 빌드",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2440, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.upstage.ai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "string",
+        "body": "={{ $json.body }}",
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "options": {}
+      },
+      "id": "node-solar-call",
+      "name": "Upstage Solar LLM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2660, 400],
+      "credentials": { "httpHeaderAuth": { "id": "upstage-api-key", "name": "Upstage API Key" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Solar 응답 파싱\nconst raw = $json.choices[0].message.content;\nlet sol;\ntry {\n  sol = JSON.parse(raw.replace(/```json\\n?/g,'').replace(/```\\n?/g,'').trim());\n} catch(e) {\n  sol = { summary: raw, trend: '유지', today_actions: [], recommended_ingredients: [], avoid_ingredients: [], case_matches: [], see_doctor_signal: false, disclaimer: '본 서비스는 의료 진단을 대체하지 않습니다. 증상이 지속되면 전문의 상담을 권장합니다.', parse_error: true };\n}\nconst payload = $('Solar 입력 빌드').item.json.payload;\nreturn [{ json: { solution: sol, payload } }];"
+      },
+      "id": "node-solar-parse",
+      "name": "솔루션 파싱",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2880, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// HTML 이메일 빌드\nconst { solution, payload } = $json;\nconst today = new Date().toLocaleDateString('ko-KR', { year:'numeric', month:'long', day:'numeric', weekday:'long' });\nconst name = payload.name || '사용자';\nconst email = payload.email;\nconst skin = payload.skin || {};\nconst med = payload.medical || {};\n\nconst metricKo = { redness:'붉은기', acne_count:'트러블', texture:'피부결', hydration:'수분도', pigmentation:'색소', pore:'모공' };\nconst metricArrow = (m, d) => {\n  const lowerBetter = ['redness','acne_count','pigmentation','pore'].includes(m);\n  const better = lowerBetter ? d < 0 : d > 0;\n  return better ? '🟢' : (d === 0 ? '⚪' : '🔴');\n};\nconst skinRows = Object.entries(skin.delta_pct||{}).map(([m,d]) => {\n  return `<tr><td style=\"padding:6px 10px;border-bottom:1px solid #eee;\">${metricArrow(m,d)} ${metricKo[m]||m}</td><td style=\"padding:6px 10px;border-bottom:1px solid #eee;text-align:right;font-variant-numeric:tabular-nums;\">${d>0?'+':''}${d}%</td></tr>`;\n}).join('');\n\nconst actions = (solution.today_actions || []).map((a,i) => `<div style=\"margin:8px 0;padding:10px 14px;background:#fef2f2;border-radius:8px;border-left:3px solid #ef4444;font-size:14px;\"><b>${i+1}.</b> ${a}</div>`).join('') || '<p style=\"color:#9ca3af;font-size:13px;\">생성된 액션이 없습니다.</p>';\n\nconst cases = (solution.case_matches || []).slice(0,5).map(c => {\n  const t = c.link ? `<a href=\"${c.link}\" style=\"color:#1d4ed8;font-weight:600;text-decoration:none;\">${c.title}</a>` : `<b>${c.title}</b>`;\n  return `<div style=\"margin:8px 0;padding:10px 14px;background:#f9fafb;border-radius:8px;border-left:3px solid #3b82f6;\">${t}<div style=\"font-size:12px;color:#666;margin-top:4px;\">${c.why_relevant || ''}</div></div>`;\n}).join('') || '<p style=\"color:#9ca3af;font-size:13px;\">매칭된 사례가 없습니다.</p>';\n\nconst recIng = (solution.recommended_ingredients||[]).map(s=>`<span style=\"display:inline-block;background:#dcfce7;color:#166534;padding:4px 10px;border-radius:999px;font-size:12px;margin:2px;\">${s}</span>`).join('');\nconst avoidIng = (solution.avoid_ingredients||[]).map(s=>`<span style=\"display:inline-block;background:#fee2e2;color:#991b1b;padding:4px 10px;border-radius:999px;font-size:12px;margin:2px;\">${s}</span>`).join('');\n\nconst medChips = [\n  ...(med.diagnoses||[]).map(d=>`<span style=\"background:#fef3c7;color:#92400e;padding:3px 9px;border-radius:6px;font-size:11px;margin:2px;display:inline-block;\">진단: ${d}</span>`),\n  ...(med.drugs||[]).map(d=>`<span style=\"background:#ede9fe;color:#5b21b6;padding:3px 9px;border-radius:6px;font-size:11px;margin:2px;display:inline-block;\">약품: ${d}</span>`),\n  ...(med.procedures||[]).map(d=>`<span style=\"background:#cffafe;color:#155e75;padding:3px 9px;border-radius:6px;font-size:11px;margin:2px;display:inline-block;\">시술: ${d}</span>`)\n].join('') || '<span style=\"color:#9ca3af;font-size:12px;\">의료 데이터 없음</span>';\n\nconst trendColor = solution.trend === '개선' ? '#10b981' : (solution.trend === '악화' ? '#ef4444' : '#6b7280');\nconst seeDoc = solution.see_doctor_signal ? `<div style=\"background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:14px;margin:16px 0;\"><b style=\"color:#c2410c;\">⚠️ 병원 상담 시그널</b><p style=\"margin:6px 0 0;font-size:13px;color:#7c2d12;\">현재 데이터 상 전문의 상담을 한 번 고려해볼 만한 신호가 감지됐어요. 진단이 아닌 안내 목적입니다.</p></div>` : '';\n\nconst html = `<!DOCTYPE html>\n<html><head><meta charset='utf-8'></head>\n<body style='font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:640px;margin:0 auto;padding:16px;color:#333;background:#f3f4f6;'>\n<div style='background:white;border-radius:16px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.1);'>\n  <div style='background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:24px 28px;color:white;'>\n    <h1 style='margin:0 0 4px;font-size:20px;font-weight:700;'>📓 ${name}님의 주간 피부 변화 리포트</h1>\n    <p style='margin:0;opacity:0.85;font-size:13px;'>${today}</p>\n    <p style='margin:10px 0 0;background:rgba(255,255,255,0.15);padding:8px 12px;border-radius:8px;font-size:13px;'>📌 ${solution.summary || ''}</p>\n  </div>\n  <div style='padding:20px 24px;'>\n\n    <div style='display:flex;gap:10px;margin-bottom:16px;align-items:center;'>\n      <div style='flex:0 0 auto;background:${trendColor};color:white;padding:6px 14px;border-radius:999px;font-size:13px;font-weight:700;'>추세 · ${solution.trend || '유지'}</div>\n      <div style='flex:1;font-size:12px;color:#666;'>베이스라인(첫 3일 평균) 대비 변화율</div>\n    </div>\n\n    <h2 style='color:#667eea;font-size:15px;margin:18px 0 8px;border-bottom:2px solid #e0e7ff;padding-bottom:6px;'>📊 시계열 피부 지표</h2>\n    <table style='width:100%;border-collapse:collapse;font-size:14px;'>${skinRows}</table>\n\n    <h2 style='color:#8b5cf6;font-size:15px;margin:18px 0 8px;border-bottom:2px solid #ede9fe;padding-bottom:6px;'>💊 의료 데이터 (Document Parse)</h2>\n    <div>${medChips}</div>\n\n    <h2 style='color:#ef4444;font-size:15px;margin:18px 0 8px;border-bottom:2px solid #fee2e2;padding-bottom:6px;'>🎯 오늘 당장 할 일 (3가지)</h2>\n    ${actions}\n\n    <h2 style='color:#10b981;font-size:15px;margin:18px 0 8px;border-bottom:2px solid #d1fae5;padding-bottom:6px;'>🧪 추천 / 회피 성분</h2>\n    <div style='margin-bottom:6px;'><b style='font-size:13px;color:#166534;'>추천:</b> ${recIng || '<span style=\"color:#9ca3af;font-size:12px;\">없음</span>'}</div>\n    <div><b style='font-size:13px;color:#991b1b;'>회피:</b> ${avoidIng || '<span style=\"color:#9ca3af;font-size:12px;\">없음</span>'}</div>\n\n    <h2 style='color:#3b82f6;font-size:15px;margin:18px 0 8px;border-bottom:2px solid #dbeafe;padding-bottom:6px;'>🔎 신뢰도 필터 통과 사례</h2>\n    ${cases}\n\n    ${seeDoc}\n\n    <div style='background:#f9fafb;border-radius:8px;padding:12px;margin-top:18px;font-size:11px;color:#6b7280;line-height:1.6;'>\n      ${solution.disclaimer || '본 서비스는 의료 진단을 대체하지 않습니다. 증상이 지속되면 전문의 상담을 권장합니다.'}\n    </div>\n  </div>\n  <div style='background:#f9fafb;padding:14px 24px;border-top:1px solid #e5e7eb;text-align:center;'>\n    <p style='margin:0;color:#9ca3af;font-size:11px;'>Powered by Upstage Solar + Document Parse · YSAI F4</p>\n  </div>\n</div></body></html>`;\n\nreturn [{ json: { html, subject: `[${today}] ${name}님의 주간 피부 변화 리포트`, toEmail: email } }];"
+      },
+      "id": "node-email-build",
+      "name": "이메일 HTML 빌드",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3100, 400]
+    },
+    {
+      "parameters": {
+        "fromEmail": "youremail@gmail.com",
+        "toEmail": "={{ $json.toEmail }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "html",
+        "html": "={{ $json.html }}",
+        "options": {}
+      },
+      "id": "node-gmail",
+      "name": "Gmail 발송",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [3320, 400],
+      "credentials": { "smtp": { "id": "gmail-smtp", "name": "Gmail SMTP" } }
+    }
+  ],
+  "connections": {
+    "피부 일기 폼": { "main": [[{ "node": "피부 사진 분석 API", "type": "main", "index": 0 }]] },
+    "피부 사진 분석 API": { "main": [[{ "node": "시계열 분석 (변화율)", "type": "main", "index": 0 }]] },
+    "시계열 분석 (변화율)": { "main": [[{ "node": "처방전 있나?", "type": "main", "index": 0 }]] },
+    "처방전 있나?": {
+      "main": [
+        [{ "node": "Upstage Document Parse", "type": "main", "index": 0 }],
+        [{ "node": "처방전 없음 → 빈값", "type": "main", "index": 0 }]
+      ]
+    },
+    "Upstage Document Parse": { "main": [[{ "node": "의료 정보 구조화", "type": "main", "index": 0 }]] },
+    "의료 정보 구조화": { "main": [[{ "node": "시계열 + 의료 결합", "type": "main", "index": 1 }]] },
+    "처방전 없음 → 빈값": { "main": [[{ "node": "시계열 + 의료 결합", "type": "main", "index": 1 }]] },
+    "시계열 + 의료 결합": { "main": [[{ "node": "검색 쿼리 & RSS URL 빌드", "type": "main", "index": 0 }]] },
+    "검색 쿼리 & RSS URL 빌드": { "main": [[{ "node": "RSS 피드 호출", "type": "main", "index": 0 }]] },
+    "RSS 피드 호출": { "main": [[{ "node": "RSS 파싱 + Trust Filter", "type": "main", "index": 0 }]] },
+    "RSS 파싱 + Trust Filter": { "main": [[{ "node": "Solar 입력 빌드", "type": "main", "index": 0 }]] },
+    "Solar 입력 빌드": { "main": [[{ "node": "Upstage Solar LLM", "type": "main", "index": 0 }]] },
+    "Upstage Solar LLM": { "main": [[{ "node": "솔루션 파싱", "type": "main", "index": 0 }]] },
+    "솔루션 파싱": { "main": [[{ "node": "이메일 HTML 빌드", "type": "main", "index": 0 }]] },
+    "이메일 HTML 빌드": { "main": [[{ "node": "Gmail 발송", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "staticData": null,
+  "tags": ["upstage", "skin", "personalized", "gmail"],
+  "triggerCount": 0,
+  "updatedAt": "2026-05-14T00:00:00.000Z",
+  "versionId": "ysai-f4-v2"
+}
