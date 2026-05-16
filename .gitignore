@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Xcode user-specific files
+xcuserdata/
+*.xcuserstate
+
+# Build outputs
+DerivedData/
+build/
+
+# Local environment
+.env
+.env.*
