@@ -1,8 +1,8 @@
 //
 //  SkinDiaryApp.swift
-//  SkinDiary
+//  AI 피부 일기
 //
-//  Created by Jaewon Kim on 5/12/26.
+//  iOS 16+ / SwiftUI 4 기준
 //
 
 import SwiftUI
